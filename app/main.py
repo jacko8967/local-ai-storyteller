@@ -158,12 +158,6 @@ async def story_new(req: StoryNewRequest):
         "story_text": story,
     }
 
-    full_story = "\n\n".join(
-    msg["content"]
-    for msg in history
-    if msg["role"] == "assistant"
-    )
-
     return {"story": build_transcript(history)}
 
 
@@ -186,11 +180,5 @@ async def story_turn(req: StoryTurnRequest):
     # Save assistant reply
     history.append({"role": "assistant", "content": story})
     session["story_text"] = story
-
-    full_story = "\n\n".join(
-    msg["content"]
-    for msg in history
-    if msg["role"] == "assistant"
-    )
 
     return {"story": build_transcript(history)}
