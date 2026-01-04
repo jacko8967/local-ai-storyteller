@@ -119,12 +119,25 @@ def build_prompt(history: list[dict]) -> str:
 # ----------------------------
 # Story endpoints
 # ----------------------------
+def build_transcript(history: list[dict]) -> str:
+    parts = []
+    for msg in history:
+        role = msg["role"]
+        content = msg["content"].strip()
+        if role == "system":
+            continue
+        if role == "user":
+            parts.append(f"> You: {content}")
+        elif role == "assistant":
+            parts.append(content)
+    return "\n\n".join(parts).strip()
+
 @app.post("/api/story/get")
 async def story_get(req: StoryGetRequest):
     session = sessions.get(req.session_id)
     if not session:
         return {"story": ""}
-    return {"story": session.get("story_text", "")}
+    return {"story": build_transcript(session["history"])}
 
 
 @app.post("/api/story/new")
@@ -145,7 +158,14 @@ async def story_new(req: StoryNewRequest):
         "story_text": story,
     }
 
-    return {"story": story}
+    full_story = "\n\n".join(
+    msg["content"]
+    for msg in history
+    if msg["role"] == "assistant"
+    )
+
+    return {"story": build_transcript(history)}
+
 
 
 @app.post("/api/story/turn")
@@ -167,4 +187,10 @@ async def story_turn(req: StoryTurnRequest):
     history.append({"role": "assistant", "content": story})
     session["story_text"] = story
 
-    return {"story": story}
+    full_story = "\n\n".join(
+    msg["content"]
+    for msg in history
+    if msg["role"] == "assistant"
+    )
+
+    return {"story": build_transcript(history)}
