@@ -7,6 +7,7 @@ from fastapi.responses import StreamingResponse
 from app.db import init_db, save_session, load_session
 
 import json
+import copy
 import httpx
 
 app = FastAPI()
@@ -30,7 +31,16 @@ app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 #   "history": [{"role": "system"/"user"/"assistant", "content": "..."}],
 #   "story_text": "..."
 # }
+
 sessions: dict[str, dict] = {}
+
+
+DEFAULT_STATE = {
+    "location": "starting_area",
+    "inventory": [],
+    "flags": {},
+    "relationships": {},
+}
 
 
 # ----------------------------
@@ -137,21 +147,47 @@ Do not mention you are an AI. Do not break character.
 """
 
 
-def build_prompt(history: list[dict]) -> str:
+def format_state(state: dict) -> str:
+    inv = state.get("inventory", [])
+    flags = state.get("flags", {})
+    rel = state.get("relationships", {})
+
+    inv_txt = ", ".join(inv) if inv else "(empty)"
+    flags_txt = ", ".join([f"{k}={v}" for k, v in flags.items()]) if flags else "(none)"
+    rel_txt = ", ".join([f"{k}:{v}" for k, v in rel.items()]) if rel else "(none)"
+
+    return (
+        "WORLD STATE (authoritative)\n"
+        f"- inventory: {inv_txt}\n"
+        f"- flags: {flags_txt}\n"
+        f"- relationships: {rel_txt}\n"
+    )
+
+
+def build_prompt(history: list[dict], state: dict) -> str:
     """
     Turn a role/content history into a single prompt string for /api/generate.
     (Simple approach for now; later we can switch to chat format.)
     """
     out = []
+    injected_state = False
+
     for msg in history:
         role = msg["role"]
         content = msg["content"].strip()
+
         if role == "system":
             out.append(content)
+            if not injected_state:
+                out.append("\n" + format_state(state).strip())
+                injected_state = True
+
         elif role == "user":
             out.append(f"\nUser: {content}")
+
         elif role == "assistant":
             out.append(f"\nAssistant: {content}")
+
     out.append("\nAssistant:")
     return "\n".join(out).strip()
 
@@ -172,6 +208,7 @@ def build_transcript(history: list[dict]) -> str:
             parts.append(content)
     return "\n\n".join(parts).strip()
 
+
 @app.post("/api/story/get")
 async def story_get(req: StoryGetRequest):
     session = sessions.get(req.session_id)
@@ -185,6 +222,7 @@ async def story_get(req: StoryGetRequest):
         sessions[req.session_id] = {
             "history": db_row["history"],
             "story_text": db_row.get("story_text", ""),
+            "state": db_row.get("state") or copy.deepcopy(DEFAULT_STATE),
         }
         session = sessions[req.session_id]
 
@@ -198,42 +236,51 @@ async def story_new(req: StoryNewRequest):
         {"role": "system", "content": SYSTEM_PROMPT.strip()},
         {"role": "user", "content": "Start a new dark fantasy adventure with a strong hook."},
     ]
+    
+    # Initialize state ONCE
+    state = copy.deepcopy(DEFAULT_STATE)
 
-    prompt = build_prompt(history)
+    # Build prompt + generate
+    prompt = build_prompt(history, state)
     story = await call_ollama(prompt, model="gemma3:latest")
 
+    # Save assistant reply
     history.append({"role": "assistant", "content": story})
-
+    
+    # Save to in-memory and DB
     sessions[req.session_id] = {
         "history": history,
         "story_text": story,
+        "state": state,
     }
 
-    save_session(req.session_id, history, story)
+    save_session(req.session_id, history, story, state)
 
     return {"story": build_transcript(history)}
 
 
 @app.post("/api/story/turn")
 async def story_turn(req: StoryTurnRequest):
+    # Retrieve session
     session = sessions.get(req.session_id)
     if not session:
         raise HTTPException(status_code=400, detail="Session not found. Click 'New Story' first.")
 
+    # Ensure state exists
+    session.setdefault("state", copy.deepcopy(DEFAULT_STATE))
+    
     history = session["history"]
-
-    # Add the player's action
     history.append({"role": "user", "content": req.action})
 
     # Build prompt + generate
-    prompt = build_prompt(history)
+    prompt = build_prompt(history, session["state"])
     story = await call_ollama(prompt, model="gemma3:latest")
 
     # Save assistant reply
     history.append({"role": "assistant", "content": story})
     session["story_text"] = story
 
-    save_session(req.session_id, history, story)
+    save_session(req.session_id, history, story, session["state"])
 
     return {"story": build_transcript(history)}
 
@@ -244,8 +291,10 @@ async def story_new_stream(req: StoryNewRequest):
         {"role": "system", "content": SYSTEM_PROMPT.strip()},
         {"role": "user", "content": "Start a new dark fantasy adventure with a strong hook."},
     ]
+    
+    state = copy.deepcopy(DEFAULT_STATE)
 
-    prompt = build_prompt(history)
+    prompt = build_prompt(history, state)
 
     async def ndjson_gen():
         assistant_text = ""
@@ -260,7 +309,10 @@ async def story_new_stream(req: StoryNewRequest):
         sessions[req.session_id] = {
             "history": history,
             "story_text": assistant_text,
+            "state": state,
         }
+
+        save_session(req.session_id, history, assistant_text, state)
 
         final_story = build_transcript(history)
         yield json.dumps({"type": "final", "story": final_story}) + "\n"
@@ -273,11 +325,14 @@ async def story_turn_stream(req: StoryTurnRequest):
     session = sessions.get(req.session_id)
     if not session:
         raise HTTPException(status_code=400, detail="Session not found. Click 'New Story' first.")
+    
+    session.setdefault("state", copy.deepcopy(DEFAULT_STATE))
 
     history = session["history"]
+    prompt = build_prompt(history, session["state"])
+    
     history.append({"role": "user", "content": req.action})
-
-    prompt = build_prompt(history)
+    prompt = build_prompt(history, session["state"])
 
     async def ndjson_gen():
         assistant_text = ""
@@ -289,7 +344,7 @@ async def story_turn_stream(req: StoryTurnRequest):
         history.append({"role": "assistant", "content": assistant_text})
         session["story_text"] = assistant_text
 
-        save_session(req.session_id, history, assistant_text)
+        save_session(req.session_id, history, assistant_text, session["state"])
 
         final_story = build_transcript(history)
         yield json.dumps({"type": "final", "story": final_story}) + "\n"
