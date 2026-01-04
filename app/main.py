@@ -9,10 +9,13 @@ from app.db import init_db, save_session, load_session
 import json
 import httpx
 
-# Initialize the database
-init_db()
-
 app = FastAPI()
+
+# Initialize DB on startup
+@app.on_event("startup")
+def _startup():
+    init_db()
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = BASE_DIR / "web"
@@ -97,11 +100,17 @@ async def stream_ollama(prompt: str, model: str):
                 async for line in r.aiter_lines():
                     if not line:
                         continue
-                    data = json.loads(line)
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
                     if data.get("response"):
                         yield data["response"]
+
                     if data.get("done") is True:
                         break
+
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=502, detail=f"Ollama error: {e.response.text}")
     except httpx.RequestError as e:
