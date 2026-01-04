@@ -7,6 +7,60 @@ function getSessionId() {
   return sid;
 }
 
+/* ============================
+   Streaming typewriter control
+   ============================ */
+const STREAM_MS_PER_CHAR = 14; // lower=faster, higher=slower (try 12–20)
+let streamQueue = "";
+let streamTimer = null;
+let streamRendered = ""; // <-- NEW: accumulates what's been shown so far
+let pendingFinalStory = null;
+let pendingFinalizeFn = null;
+
+function startTypewriter(prefix, onUpdate) {
+  // reset state for a new stream
+  streamRendered = "";
+
+  if (streamTimer) clearInterval(streamTimer);
+
+  streamTimer = setInterval(() => {
+  if (!streamQueue) {
+    // If stream is done and we were waiting to finalize, do it now
+    if (pendingFinalizeFn) {
+      const fn = pendingFinalizeFn;
+      pendingFinalizeFn = null;
+      fn();
+    }
+    return;
+  }
+
+  const take = Math.max(1, Math.floor(30 / STREAM_MS_PER_CHAR));
+  const chunk = streamQueue.slice(0, take);
+  streamQueue = streamQueue.slice(take);
+
+  streamRendered += chunk;
+  onUpdate(prefix + streamRendered);
+
+  // If we just drained the last chunk and we're waiting to finalize, finalize now
+  if (!streamQueue && pendingFinalizeFn) {
+    const fn = pendingFinalizeFn;
+    pendingFinalizeFn = null;
+    fn();
+  }
+}, STREAM_MS_PER_CHAR);
+}
+
+function stopTypewriter() {
+  if (streamTimer) clearInterval(streamTimer);
+  streamTimer = null;
+  streamQueue = "";
+  streamRendered = ""; // <-- reset
+}
+
+/* ============================ */
+
+let currentStoryText = "";
+
 function renderStory(text) {
   storyEl.innerHTML = "";
 
@@ -26,7 +80,7 @@ function renderStory(text) {
   let lastMatchIndex = -1;
   let match;
   while ((match = re.exec(t)) !== null) {
-    lastMatchIndex = match.index + (match[1] ? match[1].length : 0); // adjust if newline captured
+    lastMatchIndex = match.index + (match[1] ? match[1].length : 0);
   }
 
   let mainText = t;
@@ -37,18 +91,23 @@ function renderStory(text) {
     choicesText = t.slice(lastMatchIndex).trim();
   }
 
-  // Show transcript (everything except the latest choices block)
   const transcriptDiv = document.createElement("div");
-  transcriptDiv.textContent = mainText || "No story yet. Click 'New Story' to begin.";
+  transcriptDiv.textContent =
+    mainText || "No story yet. Click 'New Story' to begin.";
   container.appendChild(transcriptDiv);
 
-  // Render ONLY the latest choices as buttons
   if (choicesText) {
     const choicesDiv = document.createElement("div");
     choicesDiv.style.marginTop = "14px";
 
-    const lines = choicesText.split("\n").map(l => l.trim()).filter(Boolean);
-    const choiceLines = lines.filter(l => /^[1-3]\.\s+/.test(l)).slice(0, 3);
+    const lines = choicesText
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    const choiceLines = lines
+      .filter((l) => /^[1-3]\.\s+/.test(l))
+      .slice(0, 3);
 
     choiceLines.forEach((line) => {
       const m = line.match(/^([1-3])\.\s+(.*)$/);
@@ -66,7 +125,6 @@ function renderStory(text) {
       btn.style.width = "100%";
 
       btn.onclick = () => {
-        // send the choice text as the action
         actionEl.value = m[2];
         sendAction();
       };
@@ -78,11 +136,21 @@ function renderStory(text) {
   }
 
   storyEl.appendChild(container);
-
-  // Scroll to bottom
   container.scrollTop = container.scrollHeight;
 }
 
+function renderStoryProgress(text) {
+  storyEl.innerHTML = "";
+  const box = document.createElement("div");
+  box.style.whiteSpace = "pre-wrap";
+  box.style.border = "1px solid #ddd";
+  box.style.padding = "12px";
+  box.style.borderRadius = "8px";
+  box.style.minHeight = "200px";
+  box.textContent = text;
+  storyEl.appendChild(box);
+  box.scrollTop = box.scrollHeight;
+}
 
 async function api(path, body) {
   const res = await fetch(path, {
@@ -106,20 +174,88 @@ const metaEl = document.getElementById("meta");
 const sessionId = getSessionId();
 metaEl.textContent = `Session: ${sessionId}`;
 
+async function streamNdjson(path, body, onEvent) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+
+    let idx;
+    while ((idx = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, idx).trim();
+      buffer = buffer.slice(idx + 1);
+
+      if (!line) continue;
+      const evt = JSON.parse(line);
+      onEvent(evt);
+    }
+  }
+}
+
 async function loadStory() {
-  // Fetch current story state (or start if missing)
   const data = await api("/api/story/get", { session_id: sessionId });
-  storyEl.textContent = data.story || "No story yet. Click 'New Story' to begin.";
+  currentStoryText = data.story || "";
+  renderStory(currentStoryText);
 }
 
 async function newStory() {
   sendBtn.disabled = true;
   newBtn.disabled = true;
-  storyEl.textContent = "Starting a new story…";
-  const data = await api("/api/story/new", { session_id: sessionId });
-  renderStory(data.story);
-  sendBtn.disabled = false;
-  newBtn.disabled = false;
+
+  renderStoryProgress("Starting a new story…");
+
+  try {
+    await streamNdjson(
+      "/api/story/new_stream",
+      { session_id: sessionId },
+      (evt) => {
+        if (evt.type === "chunk") {
+          streamQueue += evt.text;
+          if (!streamTimer) {
+            startTypewriter("", (text) =>
+              renderStoryProgress(text)
+            );
+          }
+        } else if (evt.type === "final") {
+        // Don’t jump instantly — wait until the typewriter drains the remaining queue
+        pendingFinalStory = evt.story || "";
+        pendingFinalizeFn = () => {
+            stopTypewriter();
+            currentStoryText = pendingFinalStory || "";
+            renderStory(currentStoryText);
+        };
+
+        // In case the queue is already empty, finalize immediately
+        if (!streamQueue) {
+            const fn = pendingFinalizeFn;
+            pendingFinalizeFn = null;
+            fn();
+        }
+      }
+
+      }
+    );
+  } finally {
+    sendBtn.disabled = false;
+    newBtn.disabled = false;
+    actionEl.focus();
+  }
 }
 
 async function sendAction() {
@@ -128,15 +264,47 @@ async function sendAction() {
 
   sendBtn.disabled = true;
   newBtn.disabled = true;
-
-  storyEl.textContent += `\n\n> You: ${action}\n\n(Thinking…)`;
   actionEl.value = "";
 
+  const prefix =
+    (currentStoryText ? currentStoryText.trim() + "\n\n" : "") +
+    `> You: ${action}\n\n`;
+
+  renderStoryProgress(prefix + "(Thinking…)\n");
+
   try {
-    const data = await api("/api/story/turn", { session_id: sessionId, action });
-    renderStory(data.story);
+    await streamNdjson(
+      "/api/story/turn_stream",
+      { session_id: sessionId, action },
+      (evt) => {
+        if (evt.type === "chunk") {
+          streamQueue += evt.text;
+          if (!streamTimer) {
+            startTypewriter(prefix, (text) =>
+              renderStoryProgress(text)
+            );
+          }
+        } else if (evt.type === "final") {
+        // Don’t jump instantly — wait until the typewriter drains the remaining queue
+        pendingFinalStory = evt.story || "";
+        pendingFinalizeFn = () => {
+            stopTypewriter();
+            currentStoryText = pendingFinalStory || "";
+            renderStory(currentStoryText);
+        };
+
+        // In case the queue is already empty, finalize immediately
+        if (!streamQueue) {
+            const fn = pendingFinalizeFn;
+            pendingFinalizeFn = null;
+            fn();
+        }
+      }
+      }
+    );
   } catch (err) {
-    storyEl.textContent += `\n\n[Error]\n${err.message}`;
+    stopTypewriter();
+    renderStoryProgress(prefix + "\n[Error]\n" + err.message);
   } finally {
     sendBtn.disabled = false;
     newBtn.disabled = false;

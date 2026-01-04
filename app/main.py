@@ -3,6 +3,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pathlib import Path
 from pydantic import BaseModel
+from fastapi.responses import StreamingResponse
+
+import json
 import httpx
 
 app = FastAPI()
@@ -75,6 +78,30 @@ async def call_ollama(prompt: str, model: str) -> str:
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"Cannot reach Ollama at {ollama_url}: {str(e)}")
 
+async def stream_ollama(prompt: str, model: str):
+    """
+    Yields incremental text chunks from Ollama (/api/generate with stream=True).
+    Ollama returns JSON lines like: {"response":"...", "done":false}
+    """
+    ollama_url = "http://localhost:11434/api/generate"
+    payload = {"model": model, "prompt": prompt, "stream": True}
+
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("POST", ollama_url, json=payload) as r:
+                r.raise_for_status()
+                async for line in r.aiter_lines():
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    if data.get("response"):
+                        yield data["response"]
+                    if data.get("done") is True:
+                        break
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"Ollama error: {e.response.text}")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Cannot reach Ollama at {ollama_url}: {str(e)}")
 
 # ----------------------------
 # Existing simple generate API (still handy)
@@ -161,7 +188,6 @@ async def story_new(req: StoryNewRequest):
     return {"story": build_transcript(history)}
 
 
-
 @app.post("/api/story/turn")
 async def story_turn(req: StoryTurnRequest):
     session = sessions.get(req.session_id)
@@ -182,3 +208,60 @@ async def story_turn(req: StoryTurnRequest):
     session["story_text"] = story
 
     return {"story": build_transcript(history)}
+
+
+@app.post("/api/story/new_stream")
+async def story_new_stream(req: StoryNewRequest):
+    history = [
+        {"role": "system", "content": SYSTEM_PROMPT.strip()},
+        {"role": "user", "content": "Start a new dark fantasy adventure with a strong hook."},
+    ]
+
+    prompt = build_prompt(history)
+
+    async def ndjson_gen():
+        assistant_text = ""
+
+        # Stream chunks
+        async for chunk in stream_ollama(prompt, model="gemma3:latest"):
+            assistant_text += chunk
+            yield json.dumps({"type": "chunk", "text": chunk}) + "\n"
+
+        # Save to session
+        history.append({"role": "assistant", "content": assistant_text})
+        sessions[req.session_id] = {
+            "history": history,
+            "story_text": assistant_text,
+        }
+
+        final_story = build_transcript(history)
+        yield json.dumps({"type": "final", "story": final_story}) + "\n"
+
+    return StreamingResponse(ndjson_gen(), media_type="application/x-ndjson")
+
+
+@app.post("/api/story/turn_stream")
+async def story_turn_stream(req: StoryTurnRequest):
+    session = sessions.get(req.session_id)
+    if not session:
+        raise HTTPException(status_code=400, detail="Session not found. Click 'New Story' first.")
+
+    history = session["history"]
+    history.append({"role": "user", "content": req.action})
+
+    prompt = build_prompt(history)
+
+    async def ndjson_gen():
+        assistant_text = ""
+
+        async for chunk in stream_ollama(prompt, model="gemma3:latest"):
+            assistant_text += chunk
+            yield json.dumps({"type": "chunk", "text": chunk}) + "\n"
+
+        history.append({"role": "assistant", "content": assistant_text})
+        session["story_text"] = assistant_text
+
+        final_story = build_transcript(history)
+        yield json.dumps({"type": "final", "story": final_story}) + "\n"
+
+    return StreamingResponse(ndjson_gen(), media_type="application/x-ndjson")
