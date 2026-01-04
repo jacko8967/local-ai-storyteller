@@ -2,10 +2,31 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Local AI Storyteller</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+    #story { white-space: pre-wrap; border: 1px solid #ddd; padding: 12px; border-radius: 8px; min-height: 200px; }
+    .row { display: flex; gap: 8px; margin-top: 12px; }
+    input[type="text"] { flex: 1; padding: 10px; border-radius: 8px; border: 1px solid #ccc; }
+    button { padding: 10px 14px; border-radius: 8px; border: 1px solid #ccc; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .small { color: #666; font-size: 12px; margin-top: 8px; }
+  </style>
 </head>
 <body>
   <h1>Local AI Storyteller</h1>
-  <p>If you can see this, FastAPI is serving your webpage.</p>
+
+  <div id="story">Loading…</div>
+
+  <div class="row">
+    <input id="action" type="text" placeholder="What do you do?" />
+    <button id="send">Send</button>
+    <button id="new">New Story</button>
+  </div>
+
+  <div class="small" id="meta"></div>
+
+  <script src="/static/app.js"></script>
 </body>
 </html>
