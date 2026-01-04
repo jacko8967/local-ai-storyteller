@@ -4,9 +4,13 @@ from fastapi.responses import FileResponse
 from pathlib import Path
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
+from app.db import init_db, save_session, load_session
 
 import json
 import httpx
+
+# Initialize the database
+init_db()
 
 app = FastAPI()
 
@@ -162,8 +166,19 @@ def build_transcript(history: list[dict]) -> str:
 @app.post("/api/story/get")
 async def story_get(req: StoryGetRequest):
     session = sessions.get(req.session_id)
+
+    # If not in memory, try DB
     if not session:
-        return {"story": ""}
+        db_row = load_session(req.session_id)
+        if not db_row:
+            return {"story": ""}
+
+        sessions[req.session_id] = {
+            "history": db_row["history"],
+            "story_text": db_row.get("story_text", ""),
+        }
+        session = sessions[req.session_id]
+
     return {"story": build_transcript(session["history"])}
 
 
@@ -184,6 +199,8 @@ async def story_new(req: StoryNewRequest):
         "history": history,
         "story_text": story,
     }
+
+    save_session(req.session_id, history, story)
 
     return {"story": build_transcript(history)}
 
@@ -206,6 +223,8 @@ async def story_turn(req: StoryTurnRequest):
     # Save assistant reply
     history.append({"role": "assistant", "content": story})
     session["story_text"] = story
+
+    save_session(req.session_id, history, story)
 
     return {"story": build_transcript(history)}
 
@@ -260,6 +279,8 @@ async def story_turn_stream(req: StoryTurnRequest):
 
         history.append({"role": "assistant", "content": assistant_text})
         session["story_text"] = assistant_text
+
+        save_session(req.session_id, history, assistant_text)
 
         final_story = build_transcript(history)
         yield json.dumps({"type": "final", "story": final_story}) + "\n"
