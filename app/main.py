@@ -80,6 +80,20 @@ def index():
 # ----------------------------
 # Ollama helper
 # ----------------------------
+OLLAMA_BASE_URL = "http://localhost:11434"
+
+async def ensure_ollama_ready():
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
+            r.raise_for_status()
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Ollama is not running. Start Ollama and try again."
+        )
+
+
 async def call_ollama(prompt: str, model: str) -> str:
     ollama_url = "http://localhost:11434/api/generate"
     payload = {"model": model, "prompt": prompt, "stream": False}
@@ -231,6 +245,7 @@ async def story_get(req: StoryGetRequest):
 
 @app.post("/api/story/new")
 async def story_new(req: StoryNewRequest):
+    await ensure_ollama_ready()
     # Initialize session
     history = [
         {"role": "system", "content": SYSTEM_PROMPT.strip()},
@@ -261,6 +276,7 @@ async def story_new(req: StoryNewRequest):
 
 @app.post("/api/story/turn")
 async def story_turn(req: StoryTurnRequest):
+    await ensure_ollama_ready()
     # Retrieve session
     session = sessions.get(req.session_id)
     if not session:
@@ -287,6 +303,7 @@ async def story_turn(req: StoryTurnRequest):
 
 @app.post("/api/story/new_stream")
 async def story_new_stream(req: StoryNewRequest):
+    await ensure_ollama_ready()
     history = [
         {"role": "system", "content": SYSTEM_PROMPT.strip()},
         {"role": "user", "content": "Start a new dark fantasy adventure with a strong hook."},
@@ -298,30 +315,35 @@ async def story_new_stream(req: StoryNewRequest):
 
     async def ndjson_gen():
         assistant_text = ""
+        try:
+            async for chunk in stream_ollama(prompt, model="gemma3:latest"):
+                assistant_text += chunk
+                yield json.dumps({"type": "chunk", "text": chunk}) + "\n"
 
-        # Stream chunks
-        async for chunk in stream_ollama(prompt, model="gemma3:latest"):
-            assistant_text += chunk
-            yield json.dumps({"type": "chunk", "text": chunk}) + "\n"
+            history.append({"role": "assistant", "content": assistant_text})
+            sessions[req.session_id] = {
+                "history": history,
+                "story_text": assistant_text,
+                "state": state,
+            }
 
-        # Save to session
-        history.append({"role": "assistant", "content": assistant_text})
-        sessions[req.session_id] = {
-            "history": history,
-            "story_text": assistant_text,
-            "state": state,
-        }
+            save_session(req.session_id, history, assistant_text, state)
 
-        save_session(req.session_id, history, assistant_text, state)
+            final_story = build_transcript(history)
+            yield json.dumps({"type": "final", "story": final_story}) + "\n"
 
-        final_story = build_transcript(history)
-        yield json.dumps({"type": "final", "story": final_story}) + "\n"
+        except Exception as e:
+            yield json.dumps({
+                "type": "error",
+                "message": "Ollama is not running. Start it and try again."
+            }) + "\n"
 
     return StreamingResponse(ndjson_gen(), media_type="application/x-ndjson")
 
 
 @app.post("/api/story/turn_stream")
 async def story_turn_stream(req: StoryTurnRequest):
+    await ensure_ollama_ready()
     session = sessions.get(req.session_id)
     if not session:
         raise HTTPException(status_code=400, detail="Session not found. Click 'New Story' first.")
@@ -336,17 +358,23 @@ async def story_turn_stream(req: StoryTurnRequest):
 
     async def ndjson_gen():
         assistant_text = ""
+        try:
+            async for chunk in stream_ollama(prompt, model="gemma3:latest"):
+                assistant_text += chunk
+                yield json.dumps({"type": "chunk", "text": chunk}) + "\n"
 
-        async for chunk in stream_ollama(prompt, model="gemma3:latest"):
-            assistant_text += chunk
-            yield json.dumps({"type": "chunk", "text": chunk}) + "\n"
+            history.append({"role": "assistant", "content": assistant_text})
+            session["story_text"] = assistant_text
 
-        history.append({"role": "assistant", "content": assistant_text})
-        session["story_text"] = assistant_text
+            save_session(req.session_id, history, assistant_text, session["state"])
 
-        save_session(req.session_id, history, assistant_text, session["state"])
+            final_story = build_transcript(history)
+            yield json.dumps({"type": "final", "story": final_story}) + "\n"
 
-        final_story = build_transcript(history)
-        yield json.dumps({"type": "final", "story": final_story}) + "\n"
+        except Exception:
+            yield json.dumps({
+                "type": "error",
+                "message": "Ollama is not running. Start it and try again."
+            }) + "\n"
 
     return StreamingResponse(ndjson_gen(), media_type="application/x-ndjson")

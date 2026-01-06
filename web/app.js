@@ -7,6 +7,17 @@ function getSessionId() {
   return sid;
 }
 
+function extractErrorMessage(text) {
+  try {
+    const obj = JSON.parse(text);
+    if (obj && typeof obj.detail === "string") return obj.detail;
+    if (obj && typeof obj.message === "string") return obj.message;
+  } catch (e) {
+    // not JSON
+  }
+  return (text || "").trim() || "Request failed.";
+}
+
 /* ============================
    Streaming typewriter control
    ============================ */
@@ -160,7 +171,7 @@ async function api(path, body) {
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(text);
+    throw new Error(extractErrorMessage(text));
   }
   return res.json();
 }
@@ -182,8 +193,12 @@ async function streamNdjson(path, body, onEvent) {
   });
 
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text);
+  const text = await res.text();
+  throw new Error(extractErrorMessage(text));
+  }
+
+  if (!res.body) {
+  throw new Error("No response body (stream unavailable).");
   }
 
   const reader = res.body.getReader();
@@ -202,9 +217,13 @@ async function streamNdjson(path, body, onEvent) {
       buffer = buffer.slice(idx + 1);
 
       if (!line) continue;
-      const evt = JSON.parse(line);
-      onEvent(evt);
+      try {
+        const evt = JSON.parse(line);
+        onEvent(evt);
+      } catch (e) {
+      // Ignore malformed lines
     }
+  }
   }
 }
 
@@ -212,6 +231,8 @@ async function loadStory() {
   const data = await api("/api/story/get", { session_id: sessionId });
   currentStoryText = data.story || "";
   renderStory(currentStoryText);
+
+  
 }
 
 async function newStory() {
@@ -228,29 +249,38 @@ async function newStory() {
         if (evt.type === "chunk") {
           streamQueue += evt.text;
           if (!streamTimer) {
-            startTypewriter("", (text) =>
-              renderStoryProgress(text)
-            );
+            startTypewriter("", (text) => renderStoryProgress(text));
           }
         } else if (evt.type === "final") {
-        // Don’t jump instantly — wait until the typewriter drains the remaining queue
-        pendingFinalStory = evt.story || "";
-        pendingFinalizeFn = () => {
+          pendingFinalStory = evt.story || "";
+          pendingFinalizeFn = () => {
             stopTypewriter();
             currentStoryText = pendingFinalStory || "";
             renderStory(currentStoryText);
-        };
+          };
 
-        // In case the queue is already empty, finalize immediately
-        if (!streamQueue) {
+          if (!streamQueue) {
             const fn = pendingFinalizeFn;
             pendingFinalizeFn = null;
             fn();
+          }
+        } else if (evt.type === "error") {
+          // backend streamed error
+          stopTypewriter();
+          streamQueue = "";
+          pendingFinalStory = null;
+          pendingFinalizeFn = null;
+          renderStoryProgress("[Error]\n" + (evt.message || "Unknown error."));
         }
       }
-
-      }
     );
+  } catch (err) {
+    // fetch failed or non-200 (e.g. 503 when Ollama is down)
+    stopTypewriter();
+    streamQueue = "";
+    pendingFinalStory = null;
+    pendingFinalizeFn = null;
+    renderStoryProgress("[Error]\n" + (err?.message || String(err)));
   } finally {
     sendBtn.disabled = false;
     newBtn.disabled = false;
@@ -280,37 +310,43 @@ async function sendAction() {
         if (evt.type === "chunk") {
           streamQueue += evt.text;
           if (!streamTimer) {
-            startTypewriter(prefix, (text) =>
-              renderStoryProgress(text)
-            );
+            startTypewriter(prefix, (text) => renderStoryProgress(text));
           }
         } else if (evt.type === "final") {
-        // Don’t jump instantly — wait until the typewriter drains the remaining queue
-        pendingFinalStory = evt.story || "";
-        pendingFinalizeFn = () => {
+          pendingFinalStory = evt.story || "";
+          pendingFinalizeFn = () => {
             stopTypewriter();
             currentStoryText = pendingFinalStory || "";
             renderStory(currentStoryText);
-        };
+          };
 
-        // In case the queue is already empty, finalize immediately
-        if (!streamQueue) {
+          if (!streamQueue) {
             const fn = pendingFinalizeFn;
             pendingFinalizeFn = null;
             fn();
+          }
+        } else if (evt.type === "error") {
+          stopTypewriter();
+          streamQueue = "";
+          pendingFinalStory = null;
+          pendingFinalizeFn = null;
+          renderStoryProgress(prefix + "\n[Error]\n" + (evt.message || "Unknown error."));
         }
-      }
       }
     );
   } catch (err) {
     stopTypewriter();
-    renderStoryProgress(prefix + "\n[Error]\n" + err.message);
+    streamQueue = "";
+    pendingFinalStory = null;
+    pendingFinalizeFn = null;
+    renderStoryProgress(prefix + "\n[Error]\n" + (err?.message || String(err)));
   } finally {
     sendBtn.disabled = false;
     newBtn.disabled = false;
     actionEl.focus();
   }
 }
+
 
 sendBtn.addEventListener("click", sendAction);
 newBtn.addEventListener("click", newStory);
